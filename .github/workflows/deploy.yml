@@ -6,6 +6,8 @@ on:
 env:
   AWS_REGION: eu-north-1
   ECR_REPOSITORY: one-dev-backend
+  ECS_CLUSTER: one-dev-cluster
+  ECS_SERVICE: one-dev-backend
 
 permissions:
   id-token: write
@@ -46,3 +48,15 @@ jobs:
           docker push ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
           docker push ${{ env.IMAGE }}:latest
           echo "Pushed: \`${{ env.IMAGE }}:${{ env.IMAGE_TAG }}\` and \`${{ env.IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment \
+            --query 'service.deployments[0].id' --output text
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+          echo "Deployed to ECS service \`${{ env.ECS_SERVICE }}\`" >> $GITHUB_STEP_SUMMARY
