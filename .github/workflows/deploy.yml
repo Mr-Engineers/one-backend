@@ -1,4 +1,4 @@
-name: Build & Push to ECR
+name: Build & Deploy to ECS
 
 on:
   workflow_dispatch:
