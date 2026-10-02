@@ -34,6 +34,10 @@ def create_app() -> FastAPI:
                 "name": "Health",
                 "description": "Liveness and readiness probes.",
             },
+            {
+                "name": "Database",
+                "description": "Supabase connectivity checks.",
+            },
         ],
     )
 
