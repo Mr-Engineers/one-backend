@@ -1,22 +1,38 @@
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Query, status
 from supabase import Client
 
 from app.core.caller import CallerDep
 from app.core.errors import ApiError, error_responses
-from app.db.supabase import DbDep, call_mutation
+from app.db.stock import record_stock_change
+from app.db.supabase import DbDep, utc_now
 from app.schemas.inventory import Item, ItemCreate, ItemUpdate, MovementType, StockMovement
 
 router = APIRouter()
 
+INITIAL_STOCK_REASON = "Initial stock"
+
+
+def _with_products(db: Client, stock_rows: list[dict[str, Any]]) -> list[Item]:
+    """stock_availability rows joined with products (max_order_qty, timestamps)."""
+    if not stock_rows:
+        return []
+    skus = [row["sku"] for row in stock_rows]
+    products = {
+        row["sku"]: row
+        for row in db.table("products").select("sku,max_order_qty,created_at,updated_at").in_("sku", skus).execute().data
+    }
+    return [Item.from_rows(row, products[row["sku"]]) for row in stock_rows if row["sku"] in products]
+
 
 def fetch_item(db: Client, sku: str) -> Item:
-    """Product from the item_stock view (with on_order / is_low), or 404 unknown_sku."""
-    rows = db.table("item_stock").select("*").eq("sku", sku).limit(1).execute().data
-    if not rows:
+    """Active product with its stock, or 404 unknown_sku."""
+    rows = db.table("stock_availability").select("*").eq("sku", sku).limit(1).execute().data
+    items = _with_products(db, rows)
+    if not items:
         raise ApiError(404, "unknown_sku", f"SKU {sku} does not exist")
-    return Item.model_validate(rows[0])
+    return items[0]
 
 
 def _search_term(q: str) -> str:
@@ -28,25 +44,18 @@ def _search_term(q: str) -> str:
     "/items",
     response_model=list[Item],
     summary="List products (web)",
-    description="All products with on_hand, on_order, thresholds and location.",
+    description="Active products with on_hand, on_order, qty_needed and thresholds.",
 )
 def list_items(
     db: DbDep,
-    location: str | None = None,
-    category: str | None = None,
     q: Annotated[str | None, Query(description="Search in name and SKU.")] = None,
     below_threshold: Annotated[bool, Query(description="Only products with on_hand + on_order < reorder_threshold.")] = False,
 ) -> list[Item]:
-    query = db.table("item_stock").select("*")
-    if location:
-        query = query.eq("location", location)
-    if category:
-        query = query.eq("category", category)
+    query = db.table("stock_availability").select("*")
     if q and (term := _search_term(q)):
         query = query.or_(f"name.ilike.*{term}*,sku.ilike.*{term}*")
-    if below_threshold:
-        query = query.eq("is_low", True)
-    return [Item.model_validate(row) for row in query.order("sku").execute().data]
+    items = _with_products(db, query.order("sku").execute().data)
+    return [item for item in items if item.is_low] if below_threshold else items
 
 
 @router.get(
@@ -69,17 +78,17 @@ def get_item(sku: str, db: DbDep) -> Item:
 def list_item_movements(
     sku: str,
     db: DbDep,
-    type: MovementType | None = None,
+    movement_type: MovementType | None = None,
     since: Annotated[str | None, Query(description="ISO date/time, e.g. 2026-10-01.")] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
 ) -> list[StockMovement]:
     fetch_item(db, sku)
-    query = db.table("stock_movement_details").select("*").eq("sku", sku)
-    if type:
-        query = query.eq("type", type)
+    query = db.table("stock_movements").select("*").eq("sku", sku)
+    if movement_type:
+        query = query.eq("movement_type", movement_type)
     if since:
         query = query.gte("created_at", since)
-    rows = query.order("created_at", desc=True).limit(limit).execute().data
+    rows = query.order("created_at", desc=True).order("id", desc=True).limit(limit).execute().data
     return [StockMovement.model_validate(row) for row in rows]
 
 
@@ -88,17 +97,26 @@ def list_item_movements(
     response_model=Item,
     status_code=status.HTTP_201_CREATED,
     summary="Add a product (web)",
+    description="Creates the product and its stock level; initial_on_hand > 0 is recorded as an adjustment.",
     responses=error_responses(409, 422),
 )
 def create_item(body: ItemCreate, db: DbDep, caller: CallerDep) -> Item:
-    call_mutation(
-        db,
-        "create_item",
-        {"p_item": body.model_dump(exclude={"initial_on_hand"}), "p_initial_quantity": body.initial_on_hand},
-        caller=caller,
-        action="item.create",
-        audit_input=body.model_dump(),
-    )
+    if db.table("products").select("sku").eq("sku", body.sku).limit(1).execute().data:
+        raise ApiError(409, "sku_exists", f"SKU {body.sku} already exists")
+
+    db.table("products").insert(body.model_dump(exclude={"initial_on_hand"})).execute()
+    if body.initial_on_hand:
+        record_stock_change(
+            db,
+            sku=body.sku,
+            movement_type="adjustment",
+            on_hand_before=None,
+            on_hand_after=body.initial_on_hand,
+            caller=caller,
+            reason=INITIAL_STOCK_REASON,
+        )
+    else:
+        db.table("stock_levels").insert({"sku": body.sku, "on_hand": 0}).execute()
     return fetch_item(db, body.sku)
 
 
@@ -106,17 +124,12 @@ def create_item(body: ItemCreate, db: DbDep, caller: CallerDep) -> Item:
     "/items/{sku}",
     response_model=Item,
     summary="Change product details (web)",
-    description="Name, unit, location, thresholds. on_hand changes only through stock movements.",
+    description="Name, unit, thresholds, max_order_qty. on_hand changes only through stock movements.",
     responses=error_responses(404, 422),
 )
-def update_item(sku: str, body: ItemUpdate, db: DbDep, caller: CallerDep) -> Item:
+def update_item(sku: str, body: ItemUpdate, db: DbDep) -> Item:
     changes = body.model_dump(exclude_unset=True)
-    call_mutation(
-        db,
-        "update_item",
-        {"p_sku": sku, "p_changes": changes},
-        caller=caller,
-        action="item.update",
-        audit_input={"sku": sku, **changes},
-    )
+    rows = db.table("products").update({**changes, "updated_at": utc_now()}).eq("sku", sku).eq("active", True).execute().data
+    if not rows:
+        raise ApiError(404, "unknown_sku", f"SKU {sku} does not exist")
     return fetch_item(db, sku)

@@ -40,16 +40,16 @@ proxy-server: `http://backend:8000/api/v1`; the web reaches it as `<app>/api/...
 | Method | Path | Consumer | Description |
 |--------|------|----------|-------------|
 | GET | `/low-stock` | agent (via proxy), web | Products with `on_hand + on_order < reorder_threshold`, with `qty_needed` |
-| POST | `/purchase-orders` | agent (via proxy) **only** | Register an order placed in the marketplace (`Idempotency-Key` required) |
-| POST | `/purchase-orders/{id}/receive` | web / demo | Receive a delivery (whole or `{"quantity": n}`) |
-| POST | `/admin/scenarios/{scenario_id}/load` | demo | Reset the warehouse to a scenario |
+| POST | `/purchase-orders` | agent (via proxy) **only** | Register an order placed in the marketplace (`Idempotency-Key` UUID required) |
+| GET | `/merchants/{merchant_id}` | proxy | Supplier profile: domain age, country, verification, reputation |
+| POST | `/purchase-orders/{id}/receive` | web / demo | Receive the whole delivery |
+| POST | `/admin/scenarios/{scenario_id}/load` | demo | Reset the warehouse to a scenario (defined in `app/api/routes/admin.py`) |
 | GET | `/admin/scenarios` | web / demo | Available scenarios |
-| GET | `/purchase-orders`, `/purchase-orders/{id}` | web | Orders, filter by `status` |
+| GET | `/purchase-orders`, `/purchase-orders/{id}` | web | Orders, filter by `status` and `sku` |
 | POST | `/purchase-orders/{id}/cancel` | web | Cancel an open order |
-| GET | `/items`, `/items/{sku}`, `/items/{sku}/movements` | web | Products, stock and history |
+| GET | `/items`, `/items/{sku}`, `/items/{sku}/movements` | web | Active products, stock and history |
 | POST / PATCH | `/items`, `/items/{sku}` | web | Add a product, change thresholds |
-| POST | `/stock-movements` | web | Consume / adjust / receive without an order |
-| GET | `/audit-log` | web | Every change and rejected attempt |
+| POST | `/stock-movements` | web | `issue` from stock or `adjustment` after a count |
 | GET | `/health`, `/openapi.json` | | Health check, OpenAPI (also at the root `/openapi.json`) |
 
 Conventions: snake_case, times in ISO 8601 UTC (`2026-10-03T14:05:00Z`), amounts as
@@ -61,21 +61,20 @@ Conventions: snake_case, times in ISO 8601 UTC (`2026-10-03T14:05:00Z`), amounts
 |--------|---------|
 | `Authorization: Bearer <GATEWAY_TOKEN>` | Token issued to proxy-server. Only with it `X-On-Behalf-Of` is trusted and purchase orders can be created. Any other bearer token (e.g. a Supabase session) is an anonymous caller. |
 | `X-On-Behalf-Of` | Agent, e.g. `purchasing-agent`; recorded as the actor. |
-| `X-Request-Id` | Stored in the audit log and stock movements. |
-| `Idempotency-Key` | Required for `POST /purchase-orders`; the same key and body returns the same order (201). |
+| `X-Request-Id` | Stored with purchase orders and stock movements. |
+| `Idempotency-Key` | UUID, required for `POST /purchase-orders`; the same key and body returns the same order (201). |
 
 ## Database
 
-SQL lives in `supabase/`, run in this order in the Supabase SQL editor:
+The API works on the `warehouse` schema (`products`, `stock_levels`, `suppliers`, `purchase_orders`,
+`stock_movements`, views `stock_availability` / `low_stock`, function `receive_purchase_order`).
+In Supabase add `warehouse` to *Settings → API → Exposed schemas* and grant the `service_role`
+access to it, otherwise every request fails with `PGRST106`.
 
-- `migrations/001_inventory_schema.sql` - tables
-- `migrations/002_inventory_functions.sql` - functions every change goes through
-  (change + stock movement + audit row in one transaction) and access rules (RLS)
-- `migrations/003_warehouse_contract.sql` - alignment with the contract: one SKU per order,
-  SKU shared with the marketplace, new low-stock rule, demo scenarios. Deletes existing purchase orders.
-- `seed.sql` - loads the `happy_path` scenario
+Only receiving a purchase order runs in one database transaction. Other changes are separate
+requests; stock changes are guarded by the value read before them (409 `stock_changed` = retry).
 
-After `002` the tables are only reachable with the **service_role** key, so `SUPABASE_KEY` must be that key.
+The SQL in `supabase/` describes the previous `public` schema and is not used by the API.
 
 ## Docs
 
@@ -88,7 +87,7 @@ After `002` the tables are only reachable with the **service_role** key, so `SUP
 Set in `.env`:
 
 - `SUPABASE_URL` — project URL
-- `SUPABASE_KEY` — service-role key (the anon key has no access after migration `002`)
+- `SUPABASE_KEY` — service-role key
 - `GATEWAY_TOKEN` — token issued to proxy-server (sent as `Authorization: Bearer`)
 
 Use `get_supabase_client()` from `app.db.supabase` in route handlers when you need the client.

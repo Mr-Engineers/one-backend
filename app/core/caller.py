@@ -2,7 +2,7 @@
 import hmac
 import uuid
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import Depends, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -27,23 +27,17 @@ class Caller:
     actor: str
     via_gateway: bool
     request_id: str
+    on_behalf_of: str | None
     idempotency_key: str | None
 
-    def audit(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Audit context passed to the database functions (p_audit)."""
-        return {
-            "actor": self.actor,
-            "via_gateway": self.via_gateway,
-            "request_id": self.request_id,
-            "action": action,
-            "input": payload,
-        }
-
-    def write_idempotency_key(self, *, required: bool = False) -> str | None:
-        """Idempotency-Key for a write; always required from the gateway so agent retries are safe."""
-        if (required or self.via_gateway) and not self.idempotency_key:
+    def idempotency_uuid(self) -> str:
+        """Idempotency-Key as a UUID (purchase_orders.idempotency_key is a UUID column)."""
+        if not self.idempotency_key:
             raise ApiError(422, "validation_error", "Idempotency-Key header is required")
-        return self.idempotency_key
+        try:
+            return str(uuid.UUID(self.idempotency_key))
+        except ValueError:
+            raise ApiError(422, "validation_error", "Idempotency-Key must be a UUID") from None
 
 
 def _is_gateway(token: str | None) -> bool:
@@ -61,19 +55,21 @@ def get_caller(
     ] = None,
     x_request_id: Annotated[
         str | None,
-        Header(description="Request ID from the proxy, stored in the audit log; generated when missing."),
+        Header(description="Request ID from the proxy, stored with purchase orders and stock movements; generated when missing."),
     ] = None,
     idempotency_key: Annotated[
         str | None,
-        Header(description="Makes a POST safe to retry. Required for POST /purchase-orders."),
+        Header(description="UUID that makes a POST safe to retry. Required for POST /purchase-orders."),
     ] = None,
 ) -> Caller:
     via_gateway = _is_gateway(credentials.credentials if credentials else None)
+    # Without the gateway token anyone could claim to be the agent, so X-On-Behalf-Of is ignored
+    on_behalf_of = x_on_behalf_of if via_gateway else None
     return Caller(
-        # Without the gateway token anyone could claim to be the agent, so X-On-Behalf-Of is ignored
-        actor=(x_on_behalf_of or PROXY_ACTOR) if via_gateway else ANONYMOUS_ACTOR,
+        actor=(on_behalf_of or PROXY_ACTOR) if via_gateway else ANONYMOUS_ACTOR,
         via_gateway=via_gateway,
         request_id=x_request_id or str(uuid.uuid4()),
+        on_behalf_of=on_behalf_of,
         idempotency_key=idempotency_key,
     )
 

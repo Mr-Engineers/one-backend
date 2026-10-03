@@ -4,7 +4,7 @@ from app.core.config import get_settings
 from app.db.supabase import get_supabase_client
 from app.schemas.db_test import DbTestResponse
 
-DEMO_TABLE = "Demo"
+DEMO_TABLE = "products"
 MAX_ROWS = 100
 
 router = APIRouter()

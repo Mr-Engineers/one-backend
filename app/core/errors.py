@@ -39,9 +39,12 @@ class ErrorResponse(BaseModel):
 
 ERROR_DESCRIPTIONS = {
     403: "`gateway_required` - only available to proxy-server (Authorization: Bearer).",
-    404: "`unknown_sku`, `purchase_order_not_found` or `unknown_scenario`.",
-    409: "`idempotency_conflict`, `invalid_status`, `insufficient_stock` or `sku_exists`.",
-    422: "`validation_error` - invalid fields.",
+    404: "`unknown_sku`, `purchase_order_not_found`, `merchant_not_found` or `unknown_scenario`.",
+    409: (
+        "`idempotency_conflict`, `invalid_status`, `insufficient_stock`, `sku_exists`, "
+        "`marketplace_order_exists` or `stock_changed` (retry)."
+    ),
+    422: "`validation_error` - invalid fields; `unknown_merchant` - merchant_id not among suppliers.",
 }
 
 

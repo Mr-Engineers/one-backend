@@ -55,6 +55,10 @@ def create_app() -> FastAPI:
                 "description": "Orders placed in the marketplace and receiving their deliveries.",
             },
             {
+                "name": "Merchants",
+                "description": "Supplier profiles used by proxy-server to check orders.",
+            },
+            {
                 "name": "Demo scenarios",
                 "description": "Resetting the warehouse to a known state before a demo.",
             },
@@ -64,11 +68,7 @@ def create_app() -> FastAPI:
             },
             {
                 "name": "Stock movements",
-                "description": "Manual stock changes: consume, adjust, receive without an order (web).",
-            },
-            {
-                "name": "Audit",
-                "description": "Who changed what, including rejected attempts.",
+                "description": "Manual stock changes: issue and adjustment (web).",
             },
         ],
     )
