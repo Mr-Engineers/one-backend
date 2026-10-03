@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, status
 
 from app.api.routes.items import fetch_item
 from app.core.caller import CallerDep
+from app.core.errors import error_responses
 from app.db.supabase import DbDep, call_mutation
 from app.schemas.inventory import StockMovement, StockMovementCreate, StockMovementResult
 
@@ -12,21 +13,14 @@ router = APIRouter()
     "/stock-movements",
     response_model=StockMovementResult,
     status_code=status.HTTP_201_CREATED,
-    summary="Consume, adjust or receive without a purchase order",
+    summary="Consume, adjust or receive without a purchase order (web)",
     description=(
-        "Changes the quantity on hand and records the movement. "
-        "Not exposed to the agent - the gateway must not allow it."
+        "Changes on_hand and records the movement. Not an agent action. "
+        "Repeating a request with the same Idempotency-Key returns the first result."
     ),
-    responses={
-        200: {"description": "Replay of a request with the same Idempotency-Key."},
-        404: {"description": "Item not found."},
-        409: {"description": "Not enough stock to consume."},
-        422: {"description": "Invalid movement (e.g. adjust without a reason)."},
-    },
+    responses=error_responses(404, 409, 422),
 )
-def create_stock_movement(
-    body: StockMovementCreate, db: DbDep, caller: CallerDep, response: Response
-) -> StockMovementResult:
+def create_stock_movement(body: StockMovementCreate, db: DbDep, caller: CallerDep) -> StockMovementResult:
     result = call_mutation(
         db,
         "record_movement",
@@ -42,8 +36,6 @@ def create_stock_movement(
         action=f"stock.{body.type}",
         audit_input=body.model_dump(exclude_none=True),
     )
-    if result["replayed"]:
-        response.status_code = status.HTTP_200_OK
     return StockMovementResult(
         movement=StockMovement.model_validate(result["movement"]),
         item=fetch_item(db, body.sku),

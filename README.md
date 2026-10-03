@@ -34,48 +34,48 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ## Endpoints
 
-Office stockroom API used by the purchasing agent (through proxy-server) and the frontend.
+Warehouse API per the contract *Kontrakt API - Magazyn* (2026-10-03). Base URL for
+proxy-server: `http://backend:8000/api/v1`; the web reaches it as `<app>/api/...`.
 
-| Method | Path | Agent tool | Description |
-|--------|------|------------|-------------|
-| GET | `/api/v1/health` | | Health check |
-| GET | `/api/v1/items` | `get_stock()` | All items with stock, thresholds and `on_order` |
-| GET | `/api/v1/items/{sku}` | `get_stock(sku)` | One item |
-| GET | `/api/v1/low-stock` | `list_low_stock()` | Items below `min_qty` with `suggested_qty` |
-| GET | `/api/v1/items/{sku}/movements` | `get_movements(sku)` | Stock history of an item |
-| GET | `/api/v1/purchase-orders` | `list_purchase_orders()` | Orders, filter by `status` |
-| GET | `/api/v1/purchase-orders/{id}` | `get_purchase_order(id)` | One order with lines |
-| POST | `/api/v1/purchase-orders` | `create_purchase_order(...)` | Register an order placed in the shop (**gateway only**) |
-| POST | `/api/v1/purchase-orders/{id}/receive` | `receive_purchase_order(...)` | Put a delivery on stock |
-| POST | `/api/v1/purchase-orders/{id}/cancel` | | Cancel the undelivered rest (staff) |
-| POST | `/api/v1/stock-movements` | | Consume / adjust / receive without an order (staff) |
-| POST | `/api/v1/items` | | Add an item (admin) |
-| PATCH | `/api/v1/items/{sku}` | | Change thresholds, location, shop mapping (admin) |
-| GET | `/api/v1/audit-log` | | Every change and rejected attempt |
+| Method | Path | Consumer | Description |
+|--------|------|----------|-------------|
+| GET | `/low-stock` | agent (via proxy), web | Products with `on_hand + on_order < reorder_threshold`, with `qty_needed` |
+| POST | `/purchase-orders` | agent (via proxy) **only** | Register an order placed in the marketplace (`Idempotency-Key` required) |
+| POST | `/purchase-orders/{id}/receive` | web / demo | Receive a delivery (whole or `{"quantity": n}`) |
+| POST | `/admin/scenarios/{scenario_id}/load` | demo | Reset the warehouse to a scenario |
+| GET | `/admin/scenarios` | web / demo | Available scenarios |
+| GET | `/purchase-orders`, `/purchase-orders/{id}` | web | Orders, filter by `status` |
+| POST | `/purchase-orders/{id}/cancel` | web | Cancel an open order |
+| GET | `/items`, `/items/{sku}`, `/items/{sku}/movements` | web | Products, stock and history |
+| POST / PATCH | `/items`, `/items/{sku}` | web | Add a product, change thresholds |
+| POST | `/stock-movements` | web | Consume / adjust / receive without an order |
+| GET | `/audit-log` | web | Every change and rejected attempt |
+| GET | `/health`, `/openapi.json` | | Health check, OpenAPI (also at the root `/openapi.json`) |
 
-Which tools the agent may use is decided by proxy-server; the backend checks data
-(stock never negative, no receiving more than ordered, ...).
+Conventions: snake_case, times in ISO 8601 UTC (`2026-10-03T14:05:00Z`), amounts as
+`{"amount": "118.00", "currency": "PLN"}`, errors as `{"error": {"code": "...", "message": "..."}}`.
 
-### Gateway headers
+### Headers from proxy-server
 
 | Header | Meaning |
 |--------|---------|
-| `X-Gateway-Token` | Shared secret with proxy-server (`GATEWAY_TOKEN`). Only with it `X-Actor` is trusted and purchase orders can be created. |
-| `X-Actor` | e.g. `agent:purchasing`. Without a valid token the actor is recorded as `anonymous`. |
+| `Authorization: Bearer <GATEWAY_TOKEN>` | Token issued to proxy-server. Only with it `X-On-Behalf-Of` is trusted and purchase orders can be created. Any other bearer token (e.g. a Supabase session) is an anonymous caller. |
+| `X-On-Behalf-Of` | Agent, e.g. `purchasing-agent`; recorded as the actor. |
 | `X-Request-Id` | Stored in the audit log and stock movements. |
-| `Idempotency-Key` | Required for writes through the gateway; a retry returns the first result (HTTP 200) instead of doing the change twice. |
+| `Idempotency-Key` | Required for `POST /purchase-orders`; the same key and body returns the same order (201). |
 
 ## Database
 
-SQL lives in `supabase/`:
+SQL lives in `supabase/`, run in this order in the Supabase SQL editor:
 
-- `migrations/001_inventory_schema.sql` - tables and the `low_stock` view
-- `migrations/002_inventory_functions.sql` - views, the functions every change goes through
+- `migrations/001_inventory_schema.sql` - tables
+- `migrations/002_inventory_functions.sql` - functions every change goes through
   (change + stock movement + audit row in one transaction) and access rules (RLS)
-- `seed.sql` - demo stockroom, 4 items below their minimum
+- `migrations/003_warehouse_contract.sql` - alignment with the contract: one SKU per order,
+  SKU shared with the marketplace, new low-stock rule, demo scenarios. Deletes existing purchase orders.
+- `seed.sql` - loads the `happy_path` scenario
 
-Run them in this order in the Supabase SQL editor. After `002` the tables are only
-reachable with the **service_role** key, so `SUPABASE_KEY` must be that key.
+After `002` the tables are only reachable with the **service_role** key, so `SUPABASE_KEY` must be that key.
 
 ## Docs
 
@@ -89,6 +89,6 @@ Set in `.env`:
 
 - `SUPABASE_URL` — project URL
 - `SUPABASE_KEY` — service-role key (the anon key has no access after migration `002`)
-- `GATEWAY_TOKEN` — shared secret with proxy-server
+- `GATEWAY_TOKEN` — token issued to proxy-server (sent as `Authorization: Bearer`)
 
 Use `get_supabase_client()` from `app.db.supabase` in route handlers when you need the client.

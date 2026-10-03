@@ -1,8 +1,12 @@
-from uuid import UUID
+import hashlib
+import json
+import uuid
 
-from fastapi import APIRouter, Body, HTTPException, Response, status
+from fastapi import APIRouter, Body, status
+from supabase import Client
 
 from app.core.caller import CallerDep, GatewayCallerDep
+from app.core.errors import ApiError, error_responses
 from app.db.supabase import DbDep, call_mutation
 from app.schemas.inventory import (
     CancelRequest,
@@ -10,142 +14,141 @@ from app.schemas.inventory import (
     PurchaseOrderCreate,
     PurchaseOrderStatus,
     ReceiveRequest,
-    ReceiveResult,
 )
 
 router = APIRouter()
 
 
+def _purchase_order_uuid(purchase_order_id: str) -> str:
+    """Purchase order IDs are UUIDs; anything else cannot exist."""
+    try:
+        return str(uuid.UUID(purchase_order_id))
+    except ValueError:
+        raise ApiError(404, "purchase_order_not_found", f"Purchase order {purchase_order_id} does not exist") from None
+
+
+def fetch_purchase_order(db: Client, purchase_order_id: str) -> PurchaseOrder:
+    rows = (
+        db.table("purchase_order_details")
+        .select("*")
+        .eq("id", _purchase_order_uuid(purchase_order_id))
+        .limit(1)
+        .execute()
+        .data
+    )
+    if not rows:
+        raise ApiError(404, "purchase_order_not_found", f"Purchase order {purchase_order_id} does not exist")
+    return PurchaseOrder.from_row(rows[0])
+
+
 @router.get(
     "/purchase-orders",
     response_model=list[PurchaseOrder],
-    summary="List purchase orders (list_purchase_orders)",
-    description="Newest first. Filter by status, e.g. `ordered` for deliveries still on the way.",
+    summary="List purchase orders (web)",
+    description="Newest first. Filter by status, e.g. `open` for deliveries still on the way.",
 )
 def list_purchase_orders(db: DbDep, status: PurchaseOrderStatus | None = None) -> list[PurchaseOrder]:
     query = db.table("purchase_order_details").select("*")
     if status:
         query = query.eq("status", status)
     rows = query.order("created_at", desc=True).execute().data
-    return [PurchaseOrder.model_validate(row) for row in rows]
+    return [PurchaseOrder.from_row(row) for row in rows]
 
 
 @router.get(
     "/purchase-orders/{purchase_order_id}",
     response_model=PurchaseOrder,
-    summary="Get one purchase order (get_purchase_order)",
-    responses={404: {"description": "Purchase order not found."}},
+    summary="Get one purchase order (web)",
+    responses=error_responses(404),
 )
-def get_purchase_order(purchase_order_id: UUID, db: DbDep) -> PurchaseOrder:
-    rows = (
-        db.table("purchase_order_details")
-        .select("*")
-        .eq("id", str(purchase_order_id))
-        .limit(1)
-        .execute()
-        .data
-    )
-    if not rows:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Purchase order {purchase_order_id} not found",
-        )
-    return PurchaseOrder.model_validate(rows[0])
+def get_purchase_order(purchase_order_id: str, db: DbDep) -> PurchaseOrder:
+    return fetch_purchase_order(db, purchase_order_id)
 
 
 @router.post(
     "/purchase-orders",
     response_model=PurchaseOrder,
     status_code=status.HTTP_201_CREATED,
-    summary="Register an order placed in the shop (create_purchase_order)",
+    summary="Register an order placed in the marketplace",
     description=(
-        "Call after the order was placed in the shop (backend-2), with the shop's order ID. "
-        "Does not change quantity on hand; the ordered amounts show up as `on_order` in low-stock. "
-        "Only available through the gateway."
+        "Raises `on_order` for the SKU, so it disappears from `GET /low-stock`; `on_hand` does not change. "
+        "Requires `Idempotency-Key`: repeating a request with the same key and body returns the same order "
+        "(201, same `id`) without creating a new one. Only available to proxy-server (Authorization: Bearer)."
     ),
-    responses={
-        200: {"description": "Replay of a request with the same Idempotency-Key."},
-        403: {"description": "Not called through the gateway."},
-        404: {"description": "An item does not exist."},
-        409: {"description": "Idempotency-Key reused for a different order."},
-        422: {"description": "Invalid order (e.g. an item without shop_sku)."},
-    },
+    responses=error_responses(403, 404, 409, 422),
 )
-def create_purchase_order(
-    body: PurchaseOrderCreate, db: DbDep, caller: GatewayCallerDep, response: Response
-) -> PurchaseOrder:
+def create_purchase_order(body: PurchaseOrderCreate, db: DbDep, caller: GatewayCallerDep) -> PurchaseOrder:
+    idempotency_key = caller.write_idempotency_key(required=True)
+    payload = body.model_dump(mode="json")
+    request_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     result = call_mutation(
         db,
         "create_purchase_order",
         {
-            "p_shop_order_id": body.shop_order_id,
-            "p_lines": [line.model_dump() for line in body.lines],
-            "p_idempotency_key": caller.write_idempotency_key(),
+            "p_sku": body.sku,
+            "p_quantity": body.quantity,
+            "p_unit_price_amount": body.unit_price.amount,
+            "p_currency": body.unit_price.currency,
+            "p_marketplace_order_id": body.supplier.marketplace_order_id,
+            "p_merchant_id": body.supplier.merchant_id,
+            "p_idempotency_key": idempotency_key,
+            "p_request_hash": request_hash,
         },
         caller=caller,
         action="purchase_order.create",
-        audit_input=body.model_dump(),
+        audit_input=payload,
     )
-    if result["replayed"]:
-        response.status_code = status.HTTP_200_OK
-    return PurchaseOrder.model_validate(result["purchase_order"])
+    return PurchaseOrder.from_row(result["purchase_order"])
 
 
 @router.post(
     "/purchase-orders/{purchase_order_id}/receive",
-    response_model=ReceiveResult,
-    summary="Receive a delivery (receive_purchase_order)",
+    response_model=PurchaseOrder,
+    summary="Receive a delivery (web / demo)",
     description=(
-        "Puts delivered goods on stock. Without `lines` everything still outstanding is received; "
-        "with `lines` only the given amounts (partial delivery)."
+        "`on_hand += quantity`, `on_order -= quantity`; when everything arrived `status = received`. "
+        "Without a body the whole outstanding quantity is received; `{\"quantity\": n}` receives part of it "
+        "(the order stays `open`). Not an agent action."
     ),
-    responses={
-        404: {"description": "Purchase order not found."},
-        409: {"description": "Purchase order already received or cancelled."},
-        422: {"description": "More than outstanding, or an item not in the order."},
-    },
+    responses=error_responses(404, 409, 422),
 )
 def receive_purchase_order(
-    purchase_order_id: UUID,
+    purchase_order_id: str,
     db: DbDep,
     caller: CallerDep,
     body: ReceiveRequest | None = Body(None),
-) -> ReceiveResult:
-    lines = [line.model_dump() for line in body.lines] if body and body.lines else None
+) -> PurchaseOrder:
+    po_id = _purchase_order_uuid(purchase_order_id)
+    quantity = body.quantity if body else None
     result = call_mutation(
         db,
         "receive_purchase_order",
-        {
-            "p_purchase_order_id": str(purchase_order_id),
-            "p_lines": lines,
-            "p_idempotency_key": caller.write_idempotency_key(),
-        },
+        {"p_purchase_order_id": po_id, "p_quantity": quantity, "p_idempotency_key": caller.write_idempotency_key()},
         caller=caller,
         action="purchase_order.receive",
-        audit_input={"purchase_order_id": str(purchase_order_id), "lines": lines},
+        audit_input={"purchase_order_id": po_id, "quantity": quantity},
     )
-    return ReceiveResult.model_validate(result)
+    return PurchaseOrder.from_row(result["purchase_order"])
 
 
 @router.post(
     "/purchase-orders/{purchase_order_id}/cancel",
     response_model=PurchaseOrder,
-    summary="Cancel a purchase order (staff)",
-    description="The not yet delivered rest stops counting as on order, so the items show up in low-stock again.",
-    responses={
-        404: {"description": "Purchase order not found."},
-        409: {"description": "Purchase order already received or cancelled."},
-    },
+    summary="Cancel a purchase order (web)",
+    description=(
+        "Only `open` orders. The not yet delivered rest stops counting as `on_order`, "
+        "so the product can show up in low-stock again."
+    ),
+    responses=error_responses(404, 409, 422),
 )
-def cancel_purchase_order(
-    purchase_order_id: UUID, body: CancelRequest, db: DbDep, caller: CallerDep
-) -> PurchaseOrder:
+def cancel_purchase_order(purchase_order_id: str, body: CancelRequest, db: DbDep, caller: CallerDep) -> PurchaseOrder:
+    po_id = _purchase_order_uuid(purchase_order_id)
     result = call_mutation(
         db,
         "cancel_purchase_order",
-        {"p_purchase_order_id": str(purchase_order_id), "p_reason": body.reason},
+        {"p_purchase_order_id": po_id, "p_reason": body.reason},
         caller=caller,
         action="purchase_order.cancel",
-        audit_input={"purchase_order_id": str(purchase_order_id), "reason": body.reason},
+        audit_input={"purchase_order_id": po_id, "reason": body.reason},
     )
-    return PurchaseOrder.model_validate(result["purchase_order"])
+    return PurchaseOrder.from_row(result["purchase_order"])

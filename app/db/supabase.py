@@ -1,16 +1,20 @@
 """Database clients and data access."""
 import logging
+import re
 from functools import lru_cache
 from typing import Annotated, Any
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends
 from postgrest.exceptions import APIError
 from supabase import Client, create_client
 
 from app.core.caller import Caller
 from app.core.config import get_settings
+from app.core.errors import DEFAULT_CODES, ApiError
 
 logger = logging.getLogger(__name__)
+
+_ERROR_CODE = re.compile(r"[a-z][a-z_]*")
 
 
 @lru_cache
@@ -30,10 +34,7 @@ def get_supabase_client() -> Client:
 def get_db() -> Client:
     """FastAPI dependency: the Supabase client, or 503 when it is not configured."""
     if not get_settings().supabase_configured:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY.",
-        )
+        raise ApiError(503, "service_unavailable", "Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY.")
     return get_supabase_client()
 
 
@@ -43,23 +44,26 @@ DbDep = Annotated[Client, Depends(get_db)]
 def http_status_for(exc: APIError) -> int:
     """HTTP status for a database error.
 
-    Functions raise SQLSTATE 'PTxxx' (see supabase/migrations/002_inventory_functions.sql),
+    Functions raise SQLSTATE 'PTxxx' (see supabase/migrations/003_warehouse_contract.sql),
     which maps to status xxx. Constraint violations are client errors.
     """
     code = exc.code or ""
     if code.startswith("PT") and code[2:].isdigit():
         return int(code[2:])
     if code == "23505":  # unique_violation
-        return status.HTTP_409_CONFLICT
+        return 409
     if code in {"23502", "23514", "22P02", "22003"}:  # not null, check, invalid text, out of range
         return 422
-    return status.HTTP_502_BAD_GATEWAY
+    return 502
 
 
-def to_http_exception(exc: APIError) -> HTTPException:
-    code = http_status_for(exc)
-    detail = exc.message if code < 500 else f"Database error: {exc.message}"
-    return HTTPException(status_code=code, detail=detail)
+def to_http_exception(exc: APIError) -> ApiError:
+    """Database error as an API error. Functions put the contract error code in the HINT."""
+    status = http_status_for(exc)
+    hint = exc.hint or ""
+    code = hint if _ERROR_CODE.fullmatch(hint) else DEFAULT_CODES.get(status, "error")
+    message = exc.message if status < 500 else f"Database error: {exc.message}"
+    return ApiError(status, code, message)
 
 
 def call_mutation(
@@ -80,12 +84,12 @@ def call_mutation(
     try:
         return db.rpc(function, {**params, "p_audit": audit}).execute().data
     except APIError as exc:
-        http_exc = to_http_exception(exc)
-        _audit_failure(db, audit, http_exc)
-        raise http_exc from exc
+        api_exc = to_http_exception(exc)
+        _audit_failure(db, audit, api_exc)
+        raise api_exc from exc
 
 
-def _audit_failure(db: Client, audit: dict[str, Any], exc: HTTPException) -> None:
+def _audit_failure(db: Client, audit: dict[str, Any], exc: ApiError) -> None:
     try:
         db.table("audit_log").insert(
             {
@@ -94,7 +98,7 @@ def _audit_failure(db: Client, audit: dict[str, Any], exc: HTTPException) -> Non
                 "action": audit["action"],
                 "request_id": audit["request_id"],
                 "input": audit["input"],
-                "result": {"status_code": exc.status_code, "detail": exc.detail},
+                "result": {"status_code": exc.status_code, "code": exc.code, "message": exc.detail},
                 "status": "rejected" if exc.status_code < 500 else "error",
             }
         ).execute()

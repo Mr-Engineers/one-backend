@@ -1,9 +1,10 @@
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Query, status
 from supabase import Client
 
 from app.core.caller import CallerDep
+from app.core.errors import ApiError, error_responses
 from app.db.supabase import DbDep, call_mutation
 from app.schemas.inventory import Item, ItemCreate, ItemUpdate, MovementType, StockMovement
 
@@ -11,10 +12,10 @@ router = APIRouter()
 
 
 def fetch_item(db: Client, sku: str) -> Item:
-    """Item from the item_stock view (with on_order / is_low), or 404."""
+    """Product from the item_stock view (with on_order / is_low), or 404 unknown_sku."""
     rows = db.table("item_stock").select("*").eq("sku", sku).limit(1).execute().data
     if not rows:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Item {sku} not found")
+        raise ApiError(404, "unknown_sku", f"SKU {sku} does not exist")
     return Item.model_validate(rows[0])
 
 
@@ -26,15 +27,15 @@ def _search_term(q: str) -> str:
 @router.get(
     "/items",
     response_model=list[Item],
-    summary="List items (get_stock)",
-    description="All stockroom items with quantity, thresholds, location, shop mapping and what is on order.",
+    summary="List products (web)",
+    description="All products with on_hand, on_order, thresholds and location.",
 )
 def list_items(
     db: DbDep,
     location: str | None = None,
     category: str | None = None,
     q: Annotated[str | None, Query(description="Search in name and SKU.")] = None,
-    below_min: Annotated[bool, Query(description="Only items with quantity < min_qty.")] = False,
+    below_threshold: Annotated[bool, Query(description="Only products with on_hand + on_order < reorder_threshold.")] = False,
 ) -> list[Item]:
     query = db.table("item_stock").select("*")
     if location:
@@ -43,7 +44,7 @@ def list_items(
         query = query.eq("category", category)
     if q and (term := _search_term(q)):
         query = query.or_(f"name.ilike.*{term}*,sku.ilike.*{term}*")
-    if below_min:
+    if below_threshold:
         query = query.eq("is_low", True)
     return [Item.model_validate(row) for row in query.order("sku").execute().data]
 
@@ -51,8 +52,8 @@ def list_items(
 @router.get(
     "/items/{sku}",
     response_model=Item,
-    summary="Get one item (get_stock)",
-    responses={404: {"description": "Item not found."}},
+    summary="Get one product (web)",
+    responses=error_responses(404),
 )
 def get_item(sku: str, db: DbDep) -> Item:
     return fetch_item(db, sku)
@@ -61,9 +62,9 @@ def get_item(sku: str, db: DbDep) -> Item:
 @router.get(
     "/items/{sku}/movements",
     response_model=list[StockMovement],
-    summary="Stock movements of an item (get_movements)",
-    description="History of the item's stock changes, newest first.",
-    responses={404: {"description": "Item not found."}},
+    summary="Stock movements of a product (web)",
+    description="History of on_hand changes, newest first.",
+    responses=error_responses(404),
 )
 def list_item_movements(
     sku: str,
@@ -86,15 +87,14 @@ def list_item_movements(
     "/items",
     response_model=Item,
     status_code=status.HTTP_201_CREATED,
-    summary="Add an item (admin)",
-    responses={409: {"description": "SKU already exists."}},
+    summary="Add a product (web)",
+    responses=error_responses(409, 422),
 )
 def create_item(body: ItemCreate, db: DbDep, caller: CallerDep) -> Item:
-    payload = body.model_dump(exclude={"initial_quantity"})
     call_mutation(
         db,
         "create_item",
-        {"p_item": payload, "p_initial_quantity": body.initial_quantity},
+        {"p_item": body.model_dump(exclude={"initial_on_hand"}), "p_initial_quantity": body.initial_on_hand},
         caller=caller,
         action="item.create",
         audit_input=body.model_dump(),
@@ -105,9 +105,9 @@ def create_item(body: ItemCreate, db: DbDep, caller: CallerDep) -> Item:
 @router.patch(
     "/items/{sku}",
     response_model=Item,
-    summary="Change item details (admin)",
-    description="Name, location, thresholds, category or shop mapping. Quantity changes only through stock movements.",
-    responses={404: {"description": "Item not found."}, 422: {"description": "Invalid change."}},
+    summary="Change product details (web)",
+    description="Name, unit, location, thresholds. on_hand changes only through stock movements.",
+    responses=error_responses(404, 422),
 )
 def update_item(sku: str, body: ItemUpdate, db: DbDep, caller: CallerDep) -> Item:
     changes = body.model_dump(exclude_unset=True)

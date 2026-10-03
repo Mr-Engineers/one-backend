@@ -1,35 +1,26 @@
-from typing import Annotated
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter
 
 from app.db.supabase import DbDep
-from app.schemas.inventory import LowStockItem
+from app.schemas.inventory import LowStockItem, LowStockResponse
 
 router = APIRouter()
 
 
 @router.get(
     "/low-stock",
-    response_model=list[LowStockItem],
-    summary="Items to restock (list_low_stock)",
+    response_model=LowStockResponse,
+    summary="Products to restock",
     description=(
-        "Items below min_qty with `suggested_qty = max_qty - quantity - on_order`. "
-        "By default items already fully on order are left out, so the agent does not order them twice."
+        "Products with `on_hand + on_order < reorder_threshold`. "
+        "`qty_needed = max(target_level - on_hand - on_order, 0)`. An empty `items` list means nothing to order. "
+        "Consumer: purchasing-agent through proxy-server."
     ),
 )
-def list_low_stock(
-    db: DbDep,
-    include_on_order: Annotated[
-        bool, Query(description="Also list items whose shortage is already fully on order.")
-    ] = False,
-    orderable_only: Annotated[
-        bool, Query(description="Only items mapped to a shop product (shop_sku set).")
-    ] = False,
-) -> list[LowStockItem]:
-    query = db.table("low_stock").select("*")
-    if not include_on_order:
-        query = query.gt("suggested_qty", 0)
-    if orderable_only:
-        query = query.not_.is_("shop_sku", "null")
-    rows = query.order("sku").execute().data
-    return [LowStockItem.model_validate(row) for row in rows]
+def list_low_stock(db: DbDep) -> LowStockResponse:
+    rows = db.table("low_stock").select("*").order("sku").execute().data
+    return LowStockResponse(
+        items=[LowStockItem.model_validate(row) for row in rows],
+        generated_at=datetime.now(timezone.utc),
+    )

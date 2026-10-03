@@ -1,14 +1,72 @@
-from datetime import datetime
+"""Request / response models of the warehouse API (contract: Kontrakt API - Magazyn, 2026-10-03)."""
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Annotated, Any, Literal
-from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
 
-Sku = Annotated[str, Field(min_length=1, max_length=64, examples=["OFF-PAP-A4"])]
+
+def _utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+# Contract: ISO 8601 in UTC, e.g. 2026-10-03T14:05:00Z
+UtcDatetime = Annotated[
+    datetime,
+    PlainSerializer(_utc_iso, return_type=str, when_used="json-unless-none"),
+    Field(examples=["2026-10-03T14:05:00Z"]),
+]
+Sku = Annotated[str, Field(min_length=1, max_length=64, examples=["PAP-A4-80"])]
 PositiveInt = Annotated[int, Field(gt=0)]
 
-PurchaseOrderStatus = Literal["ordered", "partially_received", "received", "cancelled"]
+PurchaseOrderStatus = Literal["open", "received", "cancelled"]
 MovementType = Literal["receive", "consume", "adjust"]
+
+
+################################################################################
+# Money and supplier
+################################################################################
+
+
+class Money(BaseModel):
+    """Contract: amount as a decimal string with 2 places (no floats), currency per ISO 4217."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    amount: str = Field(..., pattern=r"^\d{1,10}\.\d{2}$", examples=["118.00"])
+    currency: str = Field(..., pattern=r"^[A-Z]{3}$", examples=["PLN"])
+
+    @classmethod
+    def from_db(cls, amount: Any, currency: str) -> "Money":
+        return cls(amount=str(Decimal(str(amount)).quantize(Decimal("0.01"))), currency=currency.strip())
+
+
+class Supplier(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    marketplace_order_id: str = Field(..., min_length=1, examples=["ord_8f2c"])
+    merchant_id: str = Field(..., min_length=1, examples=["mer_biuromax"])
+
+
+################################################################################
+# Low stock
+################################################################################
+
+
+class LowStockItem(BaseModel):
+    sku: str = Field(..., description="Product ID, shared with the marketplace.", examples=["PAP-A4-80"])
+    name: str = Field(..., examples=["Papier A4 80 g/m², karton 5 ryz"])
+    unit: str = Field(..., examples=["karton"])
+    on_hand: int = Field(..., description="Physical stock.", examples=[12])
+    on_order: int = Field(..., description="Sum of open purchase orders.", examples=[0])
+    reorder_threshold: int = Field(..., examples=[20])
+    target_level: int = Field(..., description="Target stock after restocking.", examples=[50])
+    qty_needed: int = Field(..., description="max(target_level - on_hand - on_order, 0)", examples=[38])
+
+
+class LowStockResponse(BaseModel):
+    items: list[LowStockItem] = Field(..., description="Empty list = nothing to order.")
+    generated_at: UtcDatetime
 
 
 ################################################################################
@@ -17,25 +75,20 @@ MovementType = Literal["receive", "consume", "adjust"]
 
 
 class Item(BaseModel):
-    """A stockroom item with its current stock."""
+    """A product with its current stock."""
 
-    sku: str = Field(..., examples=["OFF-PAP-A4"])
-    name: str = Field(..., examples=["Papier A4 500 ark."])
+    sku: str = Field(..., examples=["PAP-A4-80"])
+    name: str = Field(..., examples=["Papier A4 80 g/m², karton 5 ryz"])
+    unit: str = Field(..., examples=["karton"])
     category: str | None = Field(None, examples=["papier"])
-    unit: str = Field(..., examples=["ream"])
-    location: str = Field(..., examples=["Piętro 2 / Szafa B"])
-    quantity: int = Field(..., description="Quantity on hand.", examples=[3])
-    min_qty: int = Field(..., description="Below this the item is low on stock.", examples=[10])
-    max_qty: int = Field(..., description="Target quantity after restocking.", examples=[40])
-    shop_sku: str | None = Field(
-        None,
-        description="Product code in the shop (backend-2). Null: the agent cannot order this item.",
-        examples=["SHOP-1042"],
-    )
-    on_order: int = Field(0, description="Ordered and not yet received.", examples=[0])
-    is_low: bool = Field(..., description="quantity < min_qty", examples=[True])
-    created_at: datetime
-    updated_at: datetime
+    location: str = Field(..., examples=["Magazyn"])
+    on_hand: int = Field(..., examples=[12])
+    on_order: int = Field(..., examples=[0])
+    reorder_threshold: int = Field(..., examples=[20])
+    target_level: int = Field(..., examples=[50])
+    is_low: bool = Field(..., description="on_hand + on_order < reorder_threshold", examples=[True])
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
 
 
 class ItemCreate(BaseModel):
@@ -43,58 +96,40 @@ class ItemCreate(BaseModel):
 
     sku: Sku
     name: str = Field(..., min_length=1)
+    unit: str = Field(..., min_length=1, examples=["szt"])
     category: str | None = None
-    unit: str = "pcs"
-    location: str = Field(..., min_length=1)
-    min_qty: int = Field(..., ge=0)
-    max_qty: int = Field(..., ge=0)
-    shop_sku: str | None = None
-    initial_quantity: int = Field(0, ge=0, description="Recorded as an 'Initial stock' adjust movement.")
+    location: str = Field("Magazyn", min_length=1)
+    reorder_threshold: int = Field(..., ge=0)
+    target_level: int = Field(..., gt=0)
+    initial_on_hand: int = Field(0, ge=0, description="Recorded as an 'Initial stock' adjust movement.")
 
     @model_validator(mode="after")
-    def check_thresholds(self) -> "ItemCreate":
-        if self.max_qty < self.min_qty:
-            raise ValueError("max_qty must be >= min_qty")
+    def check_levels(self) -> "ItemCreate":
+        if self.target_level < self.reorder_threshold:
+            raise ValueError("target_level must be >= reorder_threshold")
         return self
 
 
 class ItemUpdate(BaseModel):
-    """Fields to change. quantity cannot be changed here - use stock movements."""
+    """Fields to change. on_hand cannot be changed here - use stock movements."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = Field(None, min_length=1)
-    category: str | None = None
     unit: str | None = Field(None, min_length=1)
+    category: str | None = None
     location: str | None = Field(None, min_length=1)
-    min_qty: int | None = Field(None, ge=0)
-    max_qty: int | None = Field(None, ge=0)
-    shop_sku: str | None = None
+    reorder_threshold: int | None = Field(None, ge=0)
+    target_level: int | None = Field(None, gt=0)
 
     @model_validator(mode="after")
     def check_not_empty(self) -> "ItemUpdate":
         if not self.model_fields_set:
             raise ValueError("Provide at least one field to change")
-        for field in ("name", "unit", "location", "min_qty", "max_qty"):
+        for field in ("name", "unit", "location", "reorder_threshold", "target_level"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
         return self
-
-
-class LowStockItem(BaseModel):
-    """An item below its minimum, with how much to order."""
-
-    sku: str = Field(..., examples=["OFF-PAP-A4"])
-    name: str = Field(..., examples=["Papier A4 500 ark."])
-    location: str = Field(..., examples=["Piętro 2 / Szafa B"])
-    quantity: int = Field(..., examples=[3])
-    min_qty: int = Field(..., examples=[10])
-    max_qty: int = Field(..., examples=[40])
-    on_order: int = Field(..., description="Ordered and not yet received.", examples=[0])
-    suggested_qty: int = Field(
-        ..., description="How much to order: max_qty - quantity - on_order.", examples=[37]
-    )
-    shop_sku: str | None = Field(None, examples=["SHOP-1042"])
 
 
 ################################################################################
@@ -103,16 +138,16 @@ class LowStockItem(BaseModel):
 
 
 class StockMovement(BaseModel):
-    id: UUID
+    id: str
     sku: str
     type: MovementType
     quantity_delta: int = Field(..., description="+ receive, - consume, +/- adjust.")
-    quantity_after: int
+    quantity_after: int = Field(..., description="on_hand after the movement.")
     reason: str | None = None
-    purchase_order_id: UUID | None = None
+    purchase_order_id: str | None = None
     actor: str
     request_id: str | None = None
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class StockMovementCreate(BaseModel):
@@ -126,9 +161,8 @@ class StockMovementCreate(BaseModel):
         extra="forbid",
         json_schema_extra={
             "examples": [
-                {"sku": "OFF-PAP-A4", "type": "consume", "quantity": 2},
-                {"sku": "OFF-PAP-A4", "type": "adjust", "new_quantity": 10, "reason": "Inwentaryzacja"},
-                {"sku": "OFF-PAP-A4", "type": "receive", "quantity": 5, "reason": "Przeniesione z biura B"},
+                {"sku": "PAP-A4-80", "type": "consume", "quantity": 2},
+                {"sku": "PAP-A4-80", "type": "adjust", "new_quantity": 10, "reason": "Inwentaryzacja"},
             ]
         },
     )
@@ -161,70 +195,84 @@ class StockMovementResult(BaseModel):
 ################################################################################
 
 
-class PurchaseOrderLine(BaseModel):
-    sku: str = Field(..., examples=["OFF-PAP-A4"])
-    name: str = Field(..., examples=["Papier A4 500 ark."])
-    shop_sku: str = Field(..., examples=["SHOP-1042"])
-    quantity_ordered: int = Field(..., examples=[37])
-    quantity_received: int = Field(..., examples=[0])
-    unit_price: float | None = Field(None, examples=[24.99])
-
-
-class PurchaseOrder(BaseModel):
-    id: UUID
-    status: PurchaseOrderStatus
-    shop_order_id: str | None = Field(None, examples=["ORD-7781"])
-    created_by: str = Field(..., examples=["agent:purchasing"])
-    created_at: datetime
-    received_at: datetime | None = None
-    lines: list[PurchaseOrderLine]
-
-
-class PurchaseOrderLineCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    sku: Sku
-    quantity: PositiveInt = Field(..., examples=[37])
-    unit_price: float | None = Field(None, ge=0, examples=[24.99])
-
-
 class PurchaseOrderCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    shop_order_id: str = Field(..., min_length=1, description="Order ID returned by the shop.", examples=["ORD-7781"])
-    lines: list[PurchaseOrderLineCreate] = Field(..., min_length=1)
-
-
-class ReceiveLine(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
     sku: Sku
-    quantity: PositiveInt
+    quantity: PositiveInt = Field(..., examples=[38])
+    unit_price: Money
+    supplier: Supplier
+
+
+class PurchaseOrder(BaseModel):
+    id: str = Field(..., examples=["3b91c2d4-6f0e-4b8a-9d1e-2a7c5e8f1b30"])
+    sku: str = Field(..., examples=["PAP-A4-80"])
+    quantity: int = Field(..., examples=[38])
+    quantity_received: int = Field(..., description="Received so far (partial deliveries).", examples=[0])
+    status: PurchaseOrderStatus
+    unit_price: Money
+    supplier: Supplier
+    created_by: str = Field(..., examples=["purchasing-agent"])
+    created_at: UtcDatetime
+    received_at: UtcDatetime | None = None
+    cancelled_at: UtcDatetime | None = None
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "PurchaseOrder":
+        """From a purchase_order_details row (flat database columns)."""
+        return cls(
+            id=str(row["id"]),
+            sku=row["sku"],
+            quantity=row["quantity"],
+            quantity_received=row["quantity_received"],
+            status=row["status"],
+            unit_price=Money.from_db(row["unit_price_amount"], row["currency"]),
+            supplier=Supplier(marketplace_order_id=row["marketplace_order_id"], merchant_id=row["merchant_id"]),
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+            received_at=row.get("received_at"),
+            cancelled_at=row.get("cancelled_at"),
+        )
 
 
 class ReceiveRequest(BaseModel):
-    """Omit `lines` to receive everything still outstanding."""
+    """Omit the body (or `quantity`) to receive everything still outstanding."""
 
     model_config = ConfigDict(extra="forbid")
 
-    lines: list[ReceiveLine] | None = Field(None, min_length=1)
-
-
-class ReceivedLine(BaseModel):
-    sku: str
-    quantity: int
-    quantity_after: int = Field(..., description="Quantity on hand after receiving.")
-
-
-class ReceiveResult(BaseModel):
-    purchase_order: PurchaseOrder
-    received: list[ReceivedLine] = Field(..., description="Empty when the request was a replay.")
+    quantity: PositiveInt | None = Field(None, description="Partial delivery.")
 
 
 class CancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reason: str = Field(..., min_length=1, examples=["Sklep nie ma towaru"])
+    reason: str = Field(..., min_length=1, examples=["Marketplace cancelled the order"])
+
+
+################################################################################
+# Demo scenarios
+################################################################################
+
+
+class ScenarioItem(BaseModel):
+    sku: str
+    name: str
+    unit: str
+    on_hand: int
+    on_order: int
+    reorder_threshold: int
+    target_level: int
+
+
+class Scenario(BaseModel):
+    id: str = Field(..., examples=["happy_path"])
+    description: str
+    items: list[ScenarioItem]
+
+
+class ScenarioLoadResult(BaseModel):
+    scenario_id: str = Field(..., examples=["happy_path"])
+    items_loaded: int = Field(..., examples=[2])
 
 
 ################################################################################
@@ -241,4 +289,4 @@ class AuditEntry(BaseModel):
     input: dict[str, Any]
     result: dict[str, Any] | None = None
     status: Literal["ok", "rejected", "error"]
-    created_at: datetime
+    created_at: UtcDatetime
