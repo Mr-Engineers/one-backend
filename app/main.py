@@ -1,11 +1,14 @@
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from postgrest.exceptions import APIError
 
 from app.api.routes import api_router
 from app.core.config import get_settings
+from app.db.supabase import to_http_exception
 
 
 @asynccontextmanager
@@ -38,8 +41,29 @@ def create_app() -> FastAPI:
                 "name": "Database",
                 "description": "Supabase connectivity checks.",
             },
+            {
+                "name": "Items",
+                "description": "Stockroom items, stock levels and low-stock suggestions.",
+            },
+            {
+                "name": "Stock movements",
+                "description": "Manual stock changes: consume, adjust, receive without an order.",
+            },
+            {
+                "name": "Purchase orders",
+                "description": "Orders placed in the shop and receiving their deliveries.",
+            },
+            {
+                "name": "Audit",
+                "description": "Who changed what, including rejected attempts.",
+            },
         ],
     )
+
+    @application.exception_handler(APIError)
+    async def database_error_handler(_request: Request, exc: APIError) -> JSONResponse:
+        http_exc = to_http_exception(exc)
+        return JSONResponse(status_code=http_exc.status_code, content={"detail": http_exc.detail})
 
     application.add_middleware(
         CORSMiddleware,
